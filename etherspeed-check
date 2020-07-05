@@ -1,0 +1,127 @@
+#!/bin/bash
+#title           :etherspeed-check.sh
+#description     :Simple script to check Ubiquiti and MikroTik ethernet ports
+#                 speed (once or loop)
+#author          :Krzysztof Rusinek - KR2615 @ github.com
+#date            :20200705
+#version         :0.1
+#===============================================================================
+workdir=/usr/local/bin/etherspeed-check/
+#set -o xtrace
+
+if [[ ! -e etherspeed.conf ]]; then
+    echo -e "\e[91mConfig not found! Exiting.\e[97m"
+    exit 1
+else
+    source $workdir/etherspeed.conf
+fi
+
+if [[ ! -e devices.list ]]; then
+    echo -e "\e[91mDevices list not found! Exiting.\e[97m"
+    exit 2
+fi
+
+function check_device () {
+    device="$1"
+    data=`date +%X`
+    ip=`echo $device | cut -f1 -d ";"`
+    device_name=`echo $device | cut -f2 -d ";"`
+    device_type=`echo $device | cut -f3 -d ";"`
+    linkspeed=`echo $device | cut -f4 -d ";"`
+    port=`echo $device | cut -f5 -d ";"`
+    method=`echo $device | cut -f6 -d ";"`
+    restart=`echo $device | cut -f7 -d ";"`
+
+    if [[ $linkspeed != 1000 && $linkspeed != 100 ]]; then
+	linkspeed=100
+    fi
+    if [[ -z $port ]];then
+	if [[ $device_type == 1 ]]; then
+	    #Domyślny ethernet dla Ubi
+	    port="eth0"
+	else
+	    #Domyślny ethernet dla MT
+	    port="ether1"
+	fi
+    fi
+
+    # Pobieranie prędkości za pomocą SSH
+    work=0
+    if [[ $device_type == 1 ]]; then
+	if [[ $method == 1 ]]; then
+	    #Logowanie za pomocą hasła do Ubi
+	    work=`sshpass -p "$ssh_pass" ssh -n -o StrictHostKeyChecking=no -o ConnectTimeout=3 -o UserKnownHostsFile=/dev/null $ssh_user@$ip "ethtool $port" 2> /dev/null | grep Speed | grep -Eo '[0-9]{2,4}'`
+	else
+	    #Logowanie za pomocą klucza do Ubi
+	    work=`ssh -n -o KexAlgorithms=+diffie-hellman-group1-sha1 -o StrictHostKeyChecking=no -o ConnectTimeout=3 -o UserKnownHostsFile=/dev/null $ssh_user@$ip "ethtool $port" 2> /dev/null | grep Speed | grep -Eo '[0-9]{2,4}'`
+	fi
+    else
+	if [[ $method == 1 ]]; then
+	    #Logowanie za pomocą hasła do MT
+	    work=`sshpass -p "$ssh_pass" ssh -n -o StrictHostKeyChecking=no -o ConnectTimeout=3 -o UserKnownHostsFile=/dev/null $ssh_user@$ip "/interface ethernet monitor $port once" 2> /dev/null | grep rate | grep -Eo '[0-9]{2,4}'`
+	else
+	    #Logowanie za pomocą klucza do MT
+	    echo "klucz"
+	    work=`ssh -n -o StrictHostKeyChecking=no -o ConnectTimeout=3 -o UserKnownHostsFile=/dev/null $ssh_user@$ip "/interface ethernet monitor $port once" 2> /dev/null | grep rate | grep -Eo '[0-9]{2,4}'`
+	fi
+    fi
+
+    # Sprawdzanie, próba restartu
+    if [[ -z $work ]]; then
+	echo -e "[$data] $device_name ($ip) \e[91mBłąd połączenia z urządzeniem\e[97m"
+    elif [[ $work -ge $linkspeed ]]; then
+	echo -e "[$data] $device_name ($ip) \e[32mOK\e[97m"
+	if [ -e $workdir/$device_name.flap ]; then
+	    rm $workdir/$device_name.flap
+	fi
+    else
+	#Niewłaściwa prędkość linku
+	echo -e "[$data] $port@$device_name ($ip) \e[91mPort jest zestawiony na $work Mbps \e[97m"
+	msg="Subject: etherspeed alert\r\n\r\n$device_name ($ip) - Port $port jest zestawiony na $work Mbps\r\n\r\n"
+	if [[ $restart == 1 ]]; then
+	    echo -e "\e[33mRestartuję\e[97m"
+	    msg+="Mam pozwolenie na automatyczne zrestartowanie urzadzenia wiec zaraz sprobuje to zrobic"
+	    if [[ $device_type == 1 ]]; then
+		#Próba restartu Ubiquiti
+		if [[ $method == 1 ]]; then
+		    #Logowanie za pomocą hasła do Ubi
+		    sshpass -p "$ssh_pass" ssh -n -o StrictHostKeyChecking=no -o ConnectTimeout=3 -o UserKnownHostsFile=/dev/null $ssh_user@$ip "reboot" 2> /dev/null
+		else
+		    #Logowanie za pomocą klucza do Ubi
+		    ssh -n -o KexAlgorithms=+diffie-hellman-group1-sha1 -o StrictHostKeyChecking=no -o ConnectTimeout=3 -o UserKnownHostsFile=/dev/null $ssh_user@$ip "reboot" 2> /dev/null
+		fi
+	    else
+		#Próba restartu Mikrotika
+		if [[ $method == 1 ]]; then
+		    #Logowanie za pomocą hasła do MT
+			sshpass -p "$ssh_pass" ssh -n -o StrictHostKeyChecking=no -o ConnectTimeout=3 -o UserKnownHostsFile=/dev/null $ssh_user@$ip '/log info message="System restarted by etherspeed-check" ; /system reboot' 2> /dev/null
+		else
+		    #Logowanie za pomocą klucza do MT
+		    ssh -n -o StrictHostKeyChecking=no -o ConnectTimeout=3 -o UserKnownHostsFile=/dev/null $ssh_user@$ip '/log info message="System restarted by etherspeed-check" ; /system reboot' 2> /dev/null
+		fi
+	    fi
+	fi
+	# Wysyłanie emaili
+	if [ ! -e $workdir/$device_name.flap ]; then
+	    for email in ${admin_emails[@]}; do
+		echo -e $msg | msmtp -t $email
+	    done
+	    touch $workdir/$device_name.flap
+	fi
+    fi
+}
+
+if [[ $mode == loop ]];then
+    while true; do
+	while IFS= read -r device; do
+	    check_device "$device"
+	done < "$workdir/devices.list"
+	sleep $loop_interval
+    done
+else
+    while IFS= read -r device; do
+	check_device "$device"
+    done < "$workdir/devices.list"
+fi
+
+exit 0
